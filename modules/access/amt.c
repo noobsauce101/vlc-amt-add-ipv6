@@ -85,6 +85,7 @@
 #define IGMP_REPORT_LEN 20
 #define AMT_HDR_LEN 2            /* length of AMT header on a packet */
 #define IP_HDR_LEN 20            /* length of standard IP header */
+#define IPv6_FIXED_HDR_LEN 40
 #define IP_HDR_IGMP_LEN 24       /* length of IP header with an IGMP report */
 #define UDP_HDR_LEN 8            /* length of standard UDP header */
 #define AMT_REQUEST_MSG_LEN 9
@@ -118,12 +119,19 @@
 #define AMT_IGMP_ALLOW 0x05
 #define AMT_IGMP_BLOCK 0x06
 
+#define AMT_MLD_REPORT_TYPE 143
+#define AMT_MLD_QUERY_TYPE 130
+#define AMT_MLD_DONE_TYPE 132
+
 #define MCAST_ANYCAST(is_ipv4) ((is_ipv4) ? "0.0.0.0" : "::")
 #define MCAST_ALLHOSTS "224.0.0.22"
+#define MCAST_ALL_MLDv2_CAP_ROUTERS "FF02:0:0:0:0:0:0:16"
+#define LINK_SCOPE_ALL_NODES_MCAST "FF02::1"
 #define LOCAL_LOOPBACK(is_ipv4) ((is_ipv4) ? "127.0.0.1" : "::1")
 #define AMT_PORT 2268
 
-#define DEFAULT_MTU (1500u - (20 + 8))
+#define DEFAULT_MTU (1500u - (IP_HDR_LEN + UDP_HDR_LEN))
+#define DEFAULT_MTU_IPv6 (1500u - (IPv6_FIXED_HDR_LEN + UDP_HDR_LEN))
 
 /* IPv4 Header Format */
 typedef struct _amt_ip {
@@ -138,6 +146,18 @@ typedef struct _amt_ip {
     uint32_t srcAddr;
     uint32_t destAddr;
 } amt_ip_t;
+
+struct {
+    uint8_t version; // 4 bits
+    uint8_t traffic_class;
+    uint32_t flow_label; // 20 bits
+    uint16_t payload_len;
+    uint8_t next_header;
+    uint8_t hop_limit;
+    struct in6_addr srcAddr;
+    struct in6_addr dstAddr;
+
+} amt_ipv6_t;
 
 /* IPv4 Header Format with options field */
 typedef struct _amt_ip_alert {
@@ -185,10 +205,55 @@ typedef struct _amt_igmpv3_membership_query {
     uint32_t srcIP[1];
 } amt_igmpv3_membership_query_t;
 
+/* MLDv2 Multicast Address Record Format */
+typedef struct {
+    uint8_t record_type;
+    uint8_t aux_data_len; // length in 32 bit units
+    uint16_t num_srcs;
+    struct in6_addr mcast_address;
+    struct in6_addr *sources;
+    uint32_t *auxiliary_data;
+} amt_ipv6_multicast_address_record_t;
+
+/* MLDv2 Multicast Listener Query Message */
+typedef struct {
+    uint8_t type; // 130
+    uint8_t code;
+    uint16_t checksum;
+    uint16_t max_resp_code;
+    struct in6_addr mcast_address;
+    bool s_flag;
+    uint8_t qrv; // 4 bits
+    uint8_t qqic;
+    uint16_t num_srcs;
+    struct in6_addr *srcs;
+}  amt_mldv2_listener_query_t;
+
+/* MLDv2 Multicast Listener Report Message */
+typedef struct {
+    uint8_t type; // 143
+    uint16_t checksum;
+    uint16_t num_records;
+    amt_ipv6_multicast_address_record_t *records;
+}  amt_mldv2_listener_report_t;
+
+/* MLDv1 Multicast Listener Done Message*/
+typedef struct {
+    uint8_t type; // 132
+    uint8_t code;
+    uint16_t checksum;
+    uint16_t max_resp_delay;
+    struct in6_addr mcast_addr;
+} amt_mldv1_listener_done_t;
+
 /* ATM Membership Update Format (RFC7450) */
 typedef struct _amt_membership_update_msg {
     amt_ip_alert_t ipHead;
-    amt_igmpv3_membership_report_t memReport;
+    union {
+        amt_mldv2_listener_report_t mld_memReport;
+        amt_mldv1_listener_done_t mld_listener_done;
+        amt_igmpv3_membership_report_t igmp_memReport;
+    } encapsulated;
 } amt_membership_update_msg_t;
 
 /* AMT Functions */
@@ -566,7 +631,7 @@ static int Control( stream_t *p_access, int i_query, va_list args )
 static block_t *BlockAMT(stream_t *p_access, bool *restrict eof)
 {
     access_sys_t *sys = p_access->p_sys;
-    ssize_t len = 0, shift = 0, tunnel = IP_HDR_LEN + UDP_HDR_LEN + AMT_HDR_LEN;
+    ssize_t len = 0, shift = 0, tunnel = sys->is_ipv4 ? IP_HDR_LEN + UDP_HDR_LEN + AMT_HDR_LEN : IPv6_FIXED_HDR_LEN + UDP_HDR_LEN + AMT_HDR_LEN;
 
     /* Allocate anticipated MTU buffer for holding the UDP packet suitable for native or AMT tunneled multicast */
     block_t *pkt = block_Alloc( sys->mtu + tunnel );
@@ -827,14 +892,22 @@ static void make_ip_header( amt_ip_alert_t *p_ipHead )
  */
 static int amt_sockets_init( stream_t *p_access )
 {
-    struct sockaddr_in rcvAddr;
+    struct sockaddr *rcvAddr;
+    struct sockaddr_in rcvAddr4;
+    struct sockaddr_in6 rcvAddr6;
     access_sys_t *sys = p_access->p_sys;
-    memset( &rcvAddr, 0, sizeof(struct sockaddr_in) );
+    memset( &rcvAddr4, 0, sizeof(struct sockaddr_in) );
+    memset( &rcvAddr6, 0, sizeof(struct sockaddr_in6) );
     int enable = 0, res = 0;
 
     /* Relay anycast address for discovery */
-    // sys->relayDiscoAddr.sin_family = AF_INET;
-    // sys->relayDiscoAddr.sin_port = htons( AMT_PORT );
+    if (sys->is_ipv4){
+        ((struct sockaddr_in *)&sys->relayDiscoAddr)->sin_family = AF_INET;
+        ((struct sockaddr_in *)&sys->relayDiscoAddr)->sin_port = htons( AMT_PORT );
+    } else {
+        ((struct sockaddr_in6 *)&sys->relayDiscoAddr)->sin6_family = AF_INET;
+        ((struct sockaddr_in6 *)&sys->relayDiscoAddr)->sin6_port = htons( AMT_PORT );
+    }
 
     /* create UDP socket */
     sys->sAMT = vlc_socket( AF_INET, SOCK_DGRAM, IPPROTO_UDP, true );
@@ -851,11 +924,17 @@ static int amt_sockets_init( stream_t *p_access )
         goto error;
     }
 
-    rcvAddr.sin_family      = AF_INET;
-    rcvAddr.sin_port        = htons( 0 );
-    rcvAddr.sin_addr.s_addr = INADDR_ANY;
+    rcvAddr4.sin_family      = AF_INET;
+    rcvAddr4.sin_port        = htons( 0 );
+    rcvAddr4.sin_addr.s_addr = INADDR_ANY;
 
-    if( bind(sys->sAMT, (struct sockaddr *)&rcvAddr, sizeof(rcvAddr) ) != 0 )
+    rcvAddr6.sin6_family      = AF_INET6;
+    rcvAddr6.sin6_port        = htons( 0 );
+    rcvAddr6.sin6_addr = (struct in6_addr) IN6ADDR_ANY_INIT;
+
+    rcvAddr = sys->is_ipv4 ? (struct sockaddr*) &rcvAddr4 : (struct sockaddr*) &rcvAddr6;
+
+    if( bind(sys->sAMT, rcvAddr, sys->is_ipv4 ? sizeof(rcvAddr4) : sizeof(rcvAddr6) ) != 0 )
     {
         msg_Err( p_access, "Failed to bind UDP socket error: %s", vlc_strerror(errno) );
         goto error;
@@ -869,14 +948,21 @@ static int amt_sockets_init( stream_t *p_access )
     }
 
     /* bind socket to local address */
-    struct sockaddr_in stLocalAddr =
+    struct sockaddr_in stLocalAddr4 =
     {
         .sin_family      = AF_INET,
         .sin_port        = htons( 0 ),
         .sin_addr.s_addr = INADDR_ANY,
     };
 
-    if( bind(sys->sQuery, (struct sockaddr *)&stLocalAddr, sizeof(struct sockaddr) ) != 0 )
+    struct sockaddr_in6 stLocalAddr6;
+    memset( &rcvAddr6, 0, sizeof(struct sockaddr_in6) ); 
+    stLocalAddr6.sin6_family = AF_INET6;
+    stLocalAddr6.sin6_port = htons( 0 );stLocalAddr6.sin6_addr = (struct in6_addr) IN6ADDR_ANY_INIT;
+
+    struct sockaddr *stLocalAddr = sys->is_ipv4 ? (struct sockaddr*) &stLocalAddr4 : (struct sockaddr*) &stLocalAddr6;
+
+    if( bind(sys->sQuery, stLocalAddr, sys->is_ipv4 ? sizeof(stLocalAddr4) : sizeof(stLocalAddr6) ) != 0 )
     {
         msg_Err( p_access, "Failed to bind query socket" );
         goto error;
@@ -933,8 +1019,7 @@ static void amt_send_relay_discovery_msg( stream_t *p_access, char *relay_ip )
     sys->glob_ulNonce = ulNonce;
 
     /* send it */
-    nRet = sendto( sys->sAMT, chaSendBuffer, sizeof(chaSendBuffer), 0,\
-            (struct sockaddr *)&sys->relayDiscoAddr, sizeof(struct sockaddr) );
+    nRet = sendto( sys->sAMT, chaSendBuffer, sizeof(chaSendBuffer), 0, &sys->relayDiscoAddr, sizeof(struct sockaddr) );
 
     if( nRet < 0)
         msg_Err( p_access, "Sendto failed to %s with error %d.", relay_ip, errno);
@@ -978,7 +1063,7 @@ static void amt_send_relay_request( stream_t *p_access, char *relay_ip )
      */
 
     chaSendBuffer[0] = AMT_REQUEST;
-    chaSendBuffer[1] = 0;
+    chaSendBuffer[1] = !sys->is_ipv4 ? 1 : 0;
     chaSendBuffer[2] = 0;
     chaSendBuffer[3] = 0;
 
@@ -1055,9 +1140,9 @@ static void amt_send_mem_update( stream_t *p_access, char *relay_ip, bool leave)
     amt_membership_update_msg_t memUpdateMsg;
     memset(&memUpdateMsg, 0, sizeof(memUpdateMsg));
     memcpy(&memUpdateMsg.ipHead, &p_ipHead, sizeof(p_ipHead) );
-    memcpy(&memUpdateMsg.memReport, &p_igmpMemRep, sizeof(p_igmpMemRep) );
+    memcpy(&memUpdateMsg.encapsulated.igmp_memReport, &p_igmpMemRep, sizeof(p_igmpMemRep) );
 
-    memcpy( &pSendBuffer[12], &memUpdateMsg, sizeof(memUpdateMsg) );
+    memcpy( &pSendBuffer[12], &memUpdateMsg, sizeof(memUpdateMsg.ipHead) + sizeof(memUpdateMsg.encapsulated.igmp_memReport) );
 
     send( sys->sAMT, pSendBuffer, sizeof(pSendBuffer), 0 );
 
