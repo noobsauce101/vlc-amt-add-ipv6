@@ -147,16 +147,25 @@ typedef struct _amt_ip {
     uint32_t destAddr;
 } amt_ip_t;
 
+typedef struct {
+    uint8_t next_header; // 58 -> ICMPv6
+    uint8_t length; // 0 ?
+    uint8_t option_type; // 5
+    uint8_t option_length; // 2
+    uint16_t router_alert; // 0 for MLD
+    uint16_t padding_option; // 8 << 1 (padding)
+} ipv6_hop_by_hop_option_t;
+
 struct {
-    uint8_t version; // 4 bits
-    uint8_t traffic_class;
-    uint32_t flow_label; // 20 bits
+    uint8_t version; // 4 bits = 6 for ipv6
+    uint8_t traffic_class; // 0 for now
+    uint32_t flow_label; // 20 bits, 0 for now
     uint16_t payload_len;
-    uint8_t next_header;
+    uint8_t next_header; // 0 - next header is a hop by hop option
     uint8_t hop_limit;
     struct in6_addr srcAddr;
     struct in6_addr dstAddr;
-
+    ipv6_hop_by_hop_option_t hop_by_hop_option;
 } amt_ipv6_t;
 
 /* IPv4 Header Format with options field */
@@ -743,12 +752,12 @@ static bool open_amt_tunnel( stream_t *p_access )
 
         int is_ipv4 = server->ai_family == AF_INET;
         if (sys->is_ipv4 != is_ipv4) {
-            msg_Dbg(p_access,"Resolved relay address family (%s) does not match family of resolved multicast address(es) (%s) ... trying next resolved address",is_ipv4 ? "IPv4" : "IPv6",sys->is_ipv4 ? "IPv4" : "IPv6");
+            msg_Dbg(p_access,"Resolved relay address family (%s) does not match family of resolved multicast address(es) (%s) ... trying next resolved address", is_ipv4 ? "IPv4" : "IPv6", sys->is_ipv4 ? "IPv4" : "IPv6");
             continue;
         }
 
         /* Convert to binary representation */
-        if( unlikely( inet_ntop(server->ai_family, server->ai_addr, relay_ip, INET6_ADDRSTRLEN) == NULL ) )
+        if( unlikely( inet_ntop(server->ai_family, is_ipv4 ? (void *) &((struct sockaddr_in *)server_addr)->sin_addr : (void *) &((struct sockaddr_in6 *)server_addr)->sin6_addr, relay_ip, INET6_ADDRSTRLEN) == NULL ) )
         {
             int errConv = errno;
             msg_Err(p_access, "Could not convert relay ip to binary representation: %s", gai_strerror(errConv));
@@ -904,13 +913,14 @@ static int amt_sockets_init( stream_t *p_access )
     if (sys->is_ipv4){
         ((struct sockaddr_in *)&sys->relayDiscoAddr)->sin_family = AF_INET;
         ((struct sockaddr_in *)&sys->relayDiscoAddr)->sin_port = htons( AMT_PORT );
-    } else {
-        ((struct sockaddr_in6 *)&sys->relayDiscoAddr)->sin6_family = AF_INET;
-        ((struct sockaddr_in6 *)&sys->relayDiscoAddr)->sin6_port = htons( AMT_PORT );
-    }
+    } 
+    // else {
+    //     ((struct sockaddr_in6 *)&sys->relayDiscoAddr)->sin6_family = AF_INET6;
+    //     ((struct sockaddr_in6 *)&sys->relayDiscoAddr)->sin6_port = htons( AMT_PORT );
+    // }
 
     /* create UDP socket */
-    sys->sAMT = vlc_socket( AF_INET, SOCK_DGRAM, IPPROTO_UDP, true );
+    sys->sAMT = vlc_socket( sys->is_ipv4 ? AF_INET : AF_INET6, SOCK_DGRAM, IPPROTO_UDP, true );
     if( sys->sAMT == -1 )
     {
         msg_Err( p_access, "Failed to create UDP socket" );
@@ -940,7 +950,7 @@ static int amt_sockets_init( stream_t *p_access )
         goto error;
     }
 
-    sys->sQuery = vlc_socket( AF_INET, SOCK_DGRAM, IPPROTO_UDP, true );
+    sys->sQuery = vlc_socket( sys->is_ipv4 ? AF_INET : AF_INET6, SOCK_DGRAM, IPPROTO_UDP, true );
     if( sys->sQuery == -1 )
     {
         msg_Err( p_access, "Failed to create query socket" );
@@ -1019,7 +1029,7 @@ static void amt_send_relay_discovery_msg( stream_t *p_access, char *relay_ip )
     sys->glob_ulNonce = ulNonce;
 
     /* send it */
-    nRet = sendto( sys->sAMT, chaSendBuffer, sizeof(chaSendBuffer), 0, &sys->relayDiscoAddr, sizeof(struct sockaddr) );
+    nRet = sendto( sys->sAMT, chaSendBuffer, sizeof(chaSendBuffer), 0, &sys->relayDiscoAddr, sys->is_ipv4 ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6));
 
     if( nRet < 0)
         msg_Err( p_access, "Sendto failed to %s with error %d.", relay_ip, errno);
