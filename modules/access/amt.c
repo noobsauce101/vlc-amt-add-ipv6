@@ -80,7 +80,7 @@
 
 #define MSG_TYPE_LEN 1           /* length of msg type */
 #define RELAY_QUERY_MSG_LEN 48   /* total length of relay query */
-#define RELAY_ADV_MSG_LEN 12     /* length of relay advertisement message */
+#define RELAY_ADV_MSG_LEN 24     /* length of relay advertisement message: 8 bytes + ip address (4 or 16 bytes) */
 #define IGMP_QUERY_LEN 24        /* length of encapsulated IGMP query message */
 #define IGMP_REPORT_LEN 20
 #define AMT_HDR_LEN 2            /* length of AMT header on a packet */
@@ -287,10 +287,19 @@ typedef struct _access_sys_t
 
     bool is_ipv4;
     /* Mulicast group and source */
-    struct sockaddr mcastGroupAddr;
-    struct sockaddr mcastSrcAddr;
+    union {
+        struct sockaddr_in ipv4;
+        struct sockaddr_in6 ipv6;
+    } mcastGroupAddr;
+    union {
+        struct sockaddr_in ipv4;
+        struct sockaddr_in6 ipv6;
+    } mcastSrcAddr;
     /* AMT relay imformation */
-    struct sockaddr relayDiscoAddr;
+    union {
+        struct sockaddr_in ipv4;
+        struct sockaddr_in6 ipv6;
+    } relayDiscoAddr;
 
     /* AMT Relay Membership Query data (RFC7450) */
     struct relay_mem_query_msg_t {
@@ -457,8 +466,11 @@ static int Open( vlc_object_t *p_this )
     sys->is_ipv4 = serverinfo->ai_family == AF_INET;
     mcastGroup = mcastGroup_buf;
     /* Store the binary socket representation of multicast group address */
-    sys->mcastGroupAddr = *serverinfo->ai_addr;
-
+    if (sys->is_ipv4) {
+        sys->mcastGroupAddr.ipv4 = *(struct sockaddr_in*)serverinfo->ai_addr;
+    } else {
+        sys->mcastGroupAddr.ipv6 = *(struct sockaddr_in6*)serverinfo->ai_addr;
+    }
     /* Release the allocated memory */
     freeaddrinfo( serverinfo );
     serverinfo = NULL;
@@ -512,7 +524,11 @@ static int Open( vlc_object_t *p_this )
         }
         mcastSrc = mcastSrc_buf;
         /* Store the binary socket representation of multicast source address */
-        sys->mcastSrcAddr = *serverinfo->ai_addr;
+        if (sys->is_ipv4) {
+            sys->mcastSrcAddr.ipv4 = *(struct sockaddr_in*)serverinfo->ai_addr;
+        } else {
+            sys->mcastSrcAddr.ipv6 = *(struct sockaddr_in6*)serverinfo->ai_addr;
+        }
         msg_Dbg( p_access, "Setting multicast source address to %s", mcastSrc);
     }
 
@@ -774,7 +790,11 @@ static bool open_amt_tunnel( stream_t *p_access )
         msg_Dbg( p_access, "Trying AMT Server: %s", sys->relayDisco);
 
         /* Store the binary representation */
-        sys->relayDiscoAddr = *server_addr;
+        if (is_ipv4) {
+            sys->relayDiscoAddr.ipv4 = *(struct sockaddr_in*)server_addr;
+        } else {
+            sys->relayDiscoAddr.ipv6 = *(struct sockaddr_in6*)server_addr;
+        }
 
         if( amt_sockets_init( p_access ) != 0 )
             continue; /* Try next server */
@@ -795,7 +815,7 @@ static bool open_amt_tunnel( stream_t *p_access )
 
         if( !amt_rcv_relay_mem_query( p_access ) )
         {
-            msg_Err( p_access, "Could not receive AMT relay membership query from %s, reason: %s", relay_ip, vlc_strerror(errno));
+            msg_Err( p_access, "Could not receive AMT relay membership query from %s, vlc errno: %s", relay_ip, vlc_strerror(errno));
             goto error;
         }
         msg_Dbg( p_access, "Received AMT relay membership query from %s", relay_ip );
@@ -909,16 +929,6 @@ static int amt_sockets_init( stream_t *p_access )
     memset( &rcvAddr6, 0, sizeof(struct sockaddr_in6) );
     int enable = 0, res = 0;
 
-    /* Relay anycast address for discovery */
-    if (sys->is_ipv4){
-        ((struct sockaddr_in *)&sys->relayDiscoAddr)->sin_family = AF_INET;
-        ((struct sockaddr_in *)&sys->relayDiscoAddr)->sin_port = htons( AMT_PORT );
-    } 
-    // else {
-    //     ((struct sockaddr_in6 *)&sys->relayDiscoAddr)->sin6_family = AF_INET6;
-    //     ((struct sockaddr_in6 *)&sys->relayDiscoAddr)->sin6_port = htons( AMT_PORT );
-    // }
-
     /* create UDP socket */
     sys->sAMT = vlc_socket( sys->is_ipv4 ? AF_INET : AF_INET6, SOCK_DGRAM, IPPROTO_UDP, true );
     if( sys->sAMT == -1 )
@@ -1029,7 +1039,7 @@ static void amt_send_relay_discovery_msg( stream_t *p_access, char *relay_ip )
     sys->glob_ulNonce = ulNonce;
 
     /* send it */
-    nRet = sendto( sys->sAMT, chaSendBuffer, sizeof(chaSendBuffer), 0, &sys->relayDiscoAddr, sys->is_ipv4 ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6));
+    nRet = sendto( sys->sAMT, chaSendBuffer, sizeof(chaSendBuffer), 0, (struct sockaddr*) &sys->relayDiscoAddr, sys->is_ipv4 ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6));
 
     if( nRet < 0)
         msg_Err( p_access, "Sendto failed to %s with error %d.", relay_ip, errno);
@@ -1073,7 +1083,7 @@ static void amt_send_relay_request( stream_t *p_access, char *relay_ip )
      */
 
     chaSendBuffer[0] = AMT_REQUEST;
-    chaSendBuffer[1] = !sys->is_ipv4 ? 1 : 0;
+    chaSendBuffer[1] = sys->is_ipv4 ? 1 : 0;
     chaSendBuffer[2] = 0;
     chaSendBuffer[3] = 0;
 
@@ -1127,13 +1137,13 @@ static void amt_send_mem_update( stream_t *p_access, char *relay_ip, bool leave)
 
     amt_igmpv3_groupRecord_t groupRcd;
     groupRcd.auxDatalen = 0;
-    groupRcd.ssm = ((struct sockaddr_in*)&sys->mcastGroupAddr)->sin_addr.s_addr;
+    groupRcd.ssm = sys->mcastGroupAddr.ipv4.sin_addr.s_addr;
 
-    if( ((struct sockaddr_in*)&sys->mcastGroupAddr)->sin_addr.s_addr )
+    if( sys->mcastGroupAddr.ipv4.sin_addr.s_addr )
     {
         groupRcd.type = leave ? AMT_IGMP_BLOCK:AMT_IGMP_INCLUDE;
         groupRcd.nSrc = htons(1);
-        groupRcd.srcIP[0] = ((struct sockaddr_in*)&sys->mcastGroupAddr)->sin_addr.s_addr;
+        groupRcd.srcIP[0] = sys->mcastGroupAddr.ipv4.sin_addr.s_addr;
 
     } else {
         groupRcd.type = leave ? AMT_IGMP_INCLUDE_CHANGE:AMT_IGMP_EXCLUDE_CHANGE;
@@ -1194,9 +1204,7 @@ static bool amt_rcv_relay_adv( stream_t *p_access )
             return false;
     }
 
-    struct sockaddr temp;
-    socklen_t temp_size = sizeof( struct sockaddr );
-    ssize_t len = recvfrom( sys->sAMT, pkt, RELAY_ADV_MSG_LEN, 0, &temp, &temp_size );
+    ssize_t len = recvfrom( sys->sAMT, pkt, RELAY_ADV_MSG_LEN, 0, 0, 0 );
 
     if (len < 0)
     {
@@ -1205,36 +1213,33 @@ static bool amt_rcv_relay_adv( stream_t *p_access )
     }
 
     /* AMT Relay Advertisement data (RFC7450) */
-    struct {
-        uint32_t ulRcvNonce;
-        uint32_t ipAddr;
-        uint8_t  type;
-    } relay_adv_msg;
+    uint32_t ulRcvNonce;
+    uint8_t  type;
 
-    memcpy( &relay_adv_msg.type, &pkt[0], MSG_TYPE_LEN );
-    if( relay_adv_msg.type != AMT_RELAY_ADV )
+    memcpy( &type, &pkt[0], MSG_TYPE_LEN );
+    if( type != AMT_RELAY_ADV )
     {
         msg_Err( p_access, "Received message not an AMT relay advertisement, ignoring. ");
         return false;
     }
 
-    memcpy( &relay_adv_msg.ulRcvNonce, &pkt[NONCE_LEN], NONCE_LEN );
-    if( sys->glob_ulNonce != relay_adv_msg.ulRcvNonce )
+    memcpy( &ulRcvNonce, &pkt[NONCE_LEN], NONCE_LEN );
+    if( sys->glob_ulNonce != ulRcvNonce )
     {
-        msg_Err( p_access, "Discovery nonces differ! currNonce:%x rcvd%x", sys->glob_ulNonce, (uint32_t) ntohl(relay_adv_msg.ulRcvNonce) );
+        msg_Err( p_access, "Discovery nonces differt! currNonce:%x rcvd%x", (uint32_t) htonl(sys->glob_ulNonce), (uint32_t) htonl(ulRcvNonce) );
         return false;
     }
 
-    memcpy( &relay_adv_msg.ipAddr, &pkt[8], 4 );
 
-    struct sockaddr_in relayAddr =
-    {
-        .sin_family       = AF_INET,
-        .sin_addr.s_addr  = relay_adv_msg.ipAddr,
-        .sin_port         = htons( AMT_PORT ),
-    };
+    struct sockaddr_in relayAddr4;
+    relayAddr4.sin_port = htons( AMT_PORT );
 
-    int nRet = connect( sys->sAMT, (struct sockaddr *)&relayAddr, sizeof(relayAddr) );
+    struct sockaddr_in6 relayAddr6;
+    relayAddr6.sin6_port = htons( AMT_PORT );
+
+    memcpy( sys->is_ipv4 ? &relayAddr4.sin_addr : &relayAddr6.sin6_addr , &pkt[8], sys->is_ipv4 ? 4 : 16);
+
+    int nRet = connect( sys->sAMT, sys->is_ipv4 ? (struct sockaddr*)&relayAddr4 : (struct sockaddr*)&relayAddr6, sys->is_ipv4 ? sizeof(relayAddr4) : sizeof(relayAddr6) );
     if( nRet < 0 )
     {
         msg_Err( p_access, "Error connecting AMT UDP socket: %s", vlc_strerror(errno) );
@@ -1291,9 +1296,9 @@ static bool amt_rcv_relay_mem_query( stream_t *p_access )
 
     ssize_t len = recv( sys->sAMT, pkt, RELAY_QUERY_MSG_LEN, 0 );
 
-    if (len < 0 || len != RELAY_QUERY_MSG_LEN)
+    if (len <= 0)
     {
-        msg_Err(p_access, "length less than zero");
+        msg_Err(p_access, "length less than or equal to zero");
         return false;
     }
 
@@ -1303,10 +1308,11 @@ static bool amt_rcv_relay_mem_query( stream_t *p_access )
     memcpy( &sys->relay_mem_query_msg.ulRcvedNonce, &pkt[AMT_HDR_LEN + MAC_LEN], NONCE_LEN );
     if( sys->relay_mem_query_msg.ulRcvedNonce != sys->glob_ulNonce )
     {
-        msg_Warn( p_access, "Nonces are different rcvd: %x glob: %x", sys->relay_mem_query_msg.ulRcvedNonce, sys->glob_ulNonce );
+        msg_Warn( p_access, "Nonces are different rcvd: %x glob: %x", (uint32_t) htonl(sys->relay_mem_query_msg.ulRcvedNonce), (uint32_t) htonl(sys->glob_ulNonce) );
         return false;
     }
 
+    if (sys->is_ipv4) {
     size_t shift = AMT_HDR_LEN + MAC_LEN + NONCE_LEN + IP_HDR_IGMP_LEN;
     sys->relay_igmp_query.type = pkt[shift];
     shift++; assert( shift < RELAY_QUERY_MSG_LEN);
@@ -1325,73 +1331,11 @@ static bool amt_rcv_relay_mem_query( stream_t *p_access )
 
     shift++; assert( shift < RELAY_QUERY_MSG_LEN);
     memcpy( &sys->relay_igmp_query.nSrc, &pkt[shift], 2 );
+    } else {
+        
+    }
 
     return true;
-}
-
-/**
- * Join SSM group based on input addresses, or use the defaults
- * */
-static int amt_joinSSM_group( stream_t *p_access )
-{
-#ifdef IP_ADD_SOURCE_MEMBERSHIP
-    struct ip_mreq_source imr;
-    access_sys_t *sys = p_access->p_sys;
-
-    imr.imr_multiaddr.s_addr = ((struct sockaddr_in*)&sys->mcastGroupAddr)->sin_addr.s_addr;
-    imr.imr_sourceaddr.s_addr = ((struct sockaddr_in*)&sys->mcastSrcAddr)->sin_addr.s_addr;
-    imr.imr_interface.s_addr = INADDR_ANY;
-
-    return setsockopt( sys->sAMT, IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP, (char *)&imr, sizeof(imr) );
-#else
-    errno = EINVAL;
-    return -1;
-#endif
-}
-
-static int amt_joinASM_group( stream_t *p_access )
-{
-    struct ip_mreq imr;
-    access_sys_t *sys = p_access->p_sys;
-
-    imr.imr_multiaddr.s_addr = ((struct sockaddr_in*)&sys->mcastGroupAddr)->sin_addr.s_addr;
-    imr.imr_interface.s_addr = INADDR_ANY;
-
-    return setsockopt( sys->sAMT, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *)&imr, sizeof(imr) );
-}
-
-/**
- * Leave SSM group that was joined earlier.
- * */
-static int amt_leaveSSM_group( stream_t *p_access )
-{
-#ifdef IP_DROP_SOURCE_MEMBERSHIP
-    struct ip_mreq_source imr;
-    access_sys_t *sys = p_access->p_sys;
-
-    imr.imr_multiaddr.s_addr = ((struct sockaddr_in*)&sys->mcastGroupAddr)->sin_addr.s_addr;
-    imr.imr_sourceaddr.s_addr = ((struct sockaddr_in*)&sys->mcastSrcAddr)->sin_addr.s_addr;
-    imr.imr_interface.s_addr = INADDR_ANY;
-
-    return setsockopt( sys->sAMT, IPPROTO_IP, IP_DROP_SOURCE_MEMBERSHIP, (char *)&imr, sizeof(imr) );
-#else
-    errno = EINVAL;
-    return -1;
-#endif
-}
-
-/**
- * Leave ASM group that was joined earlier.
- * */
-static int amt_leaveASM_group( stream_t *p_access )
-{
-    struct ip_mreq imr;
-    access_sys_t *sys = p_access->p_sys;
-
-    imr.imr_multiaddr.s_addr = ((struct sockaddr_in*)&sys->mcastGroupAddr)->sin_addr.s_addr;
-    imr.imr_interface.s_addr = INADDR_ANY;
-
-    return setsockopt( sys->sAMT, IPPROTO_IP, IP_DROP_MEMBERSHIP, (char *)&imr, sizeof(imr) );
 }
 
 /* A timer is spawned since IGMP membership updates need to issued periodically
