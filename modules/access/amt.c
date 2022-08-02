@@ -442,18 +442,20 @@ static int Open( vlc_object_t *p_this )
     /*                                                                        */
 
     /* If UDP port provided then assign port to stream */
-    if( url.i_port > 0 )
+    if( url.i_port > 0 ) {
+        msg_Dbg( p_access, "Parsed AMT URL port %d",url.i_port);
         i_bind_port = url.i_port;
+    }
 
-    msg_Err( p_access, "Multicast Interface is %s",var_InheritString (p_access, "miface"));
+    msg_Dbg( p_access, "Multicast Interface is %s",var_InheritString (p_access, "miface"));
     #ifdef IP_ADD_SOURCE_MEMBERSHIP
-    msg_Err( p_access, "IP_ADD_SOURCE_MEMBERSHIP is defined");
+    msg_Dbg( p_access, "IP_ADD_SOURCE_MEMBERSHIP is defined");
     #endif
     #ifdef MCAST_JOIN_SOURCE_GROUP
-    msg_Err( p_access, "MCAST_JOIN_SOURCE_GROUP is defined");
+    msg_Dbg( p_access, "MCAST_JOIN_SOURCE_GROUP is defined");
     #endif
     #ifdef IPV6_ADD_SOURCE_MEMBERSHIP
-    msg_Err( p_access, "IPV6_ADD_SOURCE_MEMBERSHIP is defined");
+    msg_Dbg( p_access, "IPV6_ADD_SOURCE_MEMBERSHIP is defined");
     #endif
     msg_Dbg( p_access, "Opening multicast: %s:%d local=%s:%d", url.psz_host, i_server_port, url.psz_path, i_bind_port );
 
@@ -756,6 +758,7 @@ static block_t *BlockAMT(stream_t *p_access, bool *restrict eof)
     pkt->p_buffer += shift;
     pkt->i_buffer -= shift;
 
+    msg_Dbg(p_access, "Received mcast/amt packet of length %d",len);
     return pkt;
 
 error:
@@ -865,7 +868,8 @@ static bool open_amt_tunnel( stream_t *p_access )
 
             /* Arm IGMP timer once we've confirmed we are getting packets */
             vlc_timer_schedule( sys->updateTimer, false,
-                        VLC_TICK_FROM_SEC( sys->relay_query.igmp.qqic ), VLC_TICK_FROM_SEC( sys->relay_query.igmp.qqic ) );
+                        VLC_TICK_FROM_SEC( sys->is_ipv4 ? sys->relay_query.igmp.qqic : sys->relay_query.mld.qqic), 0 );
+            msg_Err(p_access, "Arming timer. qqic is %d",sys->is_ipv4 ? sys->relay_query.igmp.qqic : sys->relay_query.mld.qqic);
 
             break;   /* found an active server sending UDP packets, so exit loop */
         }
@@ -892,32 +896,26 @@ error:
 /**
  * Calculate checksum
  * */
-static unsigned short ipv6_checksum( unsigned short *buffer, int nLen/*, struct in6_addr *src, struct in6_addr *dst, uint32_t icmp_len */)
+static unsigned short ipv6_checksum(stream_t *p_access, unsigned short *buffer, int nLen/*, struct in6_addr *src, struct in6_addr *dst, uint32_t icmp_len */)
 {
     int nleft = nLen;
     int sum = 0;
     unsigned short *w = buffer;
     unsigned short answer = 0;
 
-    uint8_t pseudo_header [40] = {0};
+    uint8_t pseudo_header [40];
+    memset(pseudo_header,0,40);
 
     pseudo_header[16] = 0xFF;
     pseudo_header[17] = 0x02;
-    pseudo_header[31] = 0x10;
+    pseudo_header[31] = 0x16;
 
-    // memcpy(&pseudo_header,src,16);
-    // memcpy(&pseudo_header[16],dst,16);
-
-    // uint32_t tmp = htonl(icmp_len);
-    uint32_t tmp = htonl(44); // MLD report length
+    // uint32_t tmp = htonl(nLen + 8); // MLD report + hop by hop header
+    uint32_t tmp = htonl(nLen); // MLD report length
     memcpy(&pseudo_header[32],&tmp,4);
+    pseudo_header[39] = 58; // next header = ICMPv6
 
-    pseudo_header[36] = 0; // zeroes 
-    pseudo_header[37] = 0; 
-    pseudo_header[38] = 0; 
-    pseudo_header[39] = 58; // ICMPv6 
-
-    unsigned short *buf1 = (unsigned short*) &pseudo_header;
+    unsigned short *buf1 = (unsigned short*) pseudo_header;
 
     for(int i = 0; i < 20; i++){
         sum += *buf1++;
@@ -937,9 +935,6 @@ static unsigned short ipv6_checksum( unsigned short *buffer, int nLen/*, struct 
     while (sum>>16) {
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    
-    // sum = (sum >> 16) + (sum & 0xffff);
-    // sum += (sum >> 16);
     
     answer = ~sum;
     return (answer);
@@ -1118,7 +1113,8 @@ static int amt_sockets_init( stream_t *p_access )
     struct sockaddr_in6 stLocalAddr6;
     memset( &rcvAddr6, 0, sizeof(struct sockaddr_in6) ); 
     stLocalAddr6.sin6_family = AF_INET6;
-    stLocalAddr6.sin6_port = htons( 0 );stLocalAddr6.sin6_addr = (struct in6_addr) IN6ADDR_ANY_INIT;
+    stLocalAddr6.sin6_port = htons( 0 );
+    stLocalAddr6.sin6_addr = (struct in6_addr) IN6ADDR_ANY_INIT;
 
     struct sockaddr *stLocalAddr = sys->is_ipv4 ? (struct sockaddr*) &stLocalAddr4 : (struct sockaddr*) &stLocalAddr6;
 
@@ -1311,10 +1307,9 @@ static int serialize_mld_report(amt_mldv2_listener_report_t *report, uint8_t *bu
     i += 16;
 
     // get checksum over buffer and write it back into the right place
-    tmp = htons(ipv6_checksum((unsigned short*)buf, buflen));
+    tmp = htons(ipv6_checksum(p_access,(unsigned short*)buf, buflen));
     // tmp = htons(ipv6_checksum((unsigned short*)buf, buflen, src, dst, icmp_len));
-    msg_Dbg( p_access , "Checksum is 0x%x (should be 0x6ec6)\n cheating and using hardcoded value...",tmp);
-    // tmp = 0x6ec6;
+    msg_Dbg( p_access , "Ipv6 Checksum is 0x%x",tmp);
     buf[2] = tmp >> 8;
     buf[3] = tmp & 0xFF;
 
@@ -1498,16 +1493,17 @@ static bool amt_rcv_relay_adv( stream_t *p_access )
     memcpy( &ulRcvNonce, &pkt[NONCE_LEN], NONCE_LEN );
     if( sys->glob_ulNonce != ulRcvNonce )
     {
-        msg_Err( p_access, "Discovery nonces differt! currNonce:%x rcvd%x", (uint32_t) htonl(sys->glob_ulNonce), (uint32_t) htonl(ulRcvNonce) );
+        msg_Err( p_access, "Discovery nonces differ! currNonce: %x rcvd: %x", (uint32_t) htonl(sys->glob_ulNonce), (uint32_t) htonl(ulRcvNonce) );
         return false;
     }
 
-
     struct sockaddr_in relayAddr4;
     relayAddr4.sin_port = htons( AMT_PORT );
+    relayAddr4.sin_family = AF_INET;
 
     struct sockaddr_in6 relayAddr6;
     relayAddr6.sin6_port = htons( AMT_PORT );
+    relayAddr6.sin6_family = AF_INET6;
 
     memcpy( sys->is_ipv4 ? (void*) &relayAddr4.sin_addr : (void*) &relayAddr6.sin6_addr , &pkt[8], sys->is_ipv4 ? 4 : 16);
 
@@ -1621,6 +1617,9 @@ static bool amt_rcv_relay_mem_query( stream_t *p_access )
         sys->relay_query.mld.s_flag = pkt[offset] & (1 << 3); // 4th bit
         offset++;
         sys->relay_query.mld.qqic = pkt[offset++];
+        if (!sys->relay_query.mld.qqic) {
+            sys->relay_query.mld.qqic = 125;
+        }
         memcpy( &temp_s, &pkt[offset], 2 );
         sys->relay_query.mld.num_srcs = ntohs(temp_s);
         offset += 2;
@@ -1660,5 +1659,5 @@ static void amt_update_timer_cb( void *data )
     /* Arms the timer again for a single shot from this callback. That way, the
      * time spent in amt_send_mem_update() is taken into consideration. */
     vlc_timer_schedule( sys->updateTimer, false,
-                        VLC_TICK_FROM_SEC( sys->relay_query.igmp.qqic ), 0 );
+                        VLC_TICK_FROM_SEC( sys->is_ipv4 ? sys->relay_query.igmp.qqic : sys->relay_query.mld.qqic), 0 );
 }
